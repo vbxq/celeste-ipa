@@ -1,0 +1,16 @@
+Discord.ipa
+Celeste.ipa
+discord-extracted/
+CelestePatch/obj/
+CelestePatch/.theos/
+CelestePatch/packages/
+*.dylib
+!CelestePatch/CelestePatch.dylib
+/CelestePatch.dylib
+tools/*
+!tools/insert_dylib.py
+!tools/spoof_ua.py
+!tools/chrome-macos.sh
+.idea/
+*.log
+*.md

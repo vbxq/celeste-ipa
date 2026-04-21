@@ -1,0 +1,23 @@
+{
+  "name": "Celeste",
+  "identifier": "gg.celeste.source",
+  "sourceURL": "https://github.com/vbxq/celeste-ios/releases/latest/download/source.json",
+  "apps": [
+    {
+      "name": "Celeste",
+      "bundleIdentifier": "gg.celeste.app",
+      "developerName": "Celeste",
+      "subtitle": "Celeste client for iOS",
+      "localizedDescription": "Discord-compatible client connected to Celeste.",
+      "iconURL": "https://raw.githubusercontent.com/vbxq/celeste-ios/main/icon.png",
+      "versions": [
+        {
+          "version": "324.0",
+          "date": "2026-04-21",
+          "downloadURL": "https://github.com/vbxq/celeste-ios/releases/latest/download/Celeste.ipa",
+          "size": 98272409
+        }
+      ]
+    }
+  ]
+}
