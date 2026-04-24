@@ -53,6 +53,23 @@ for host in ("celeste.gg","alpha.celeste.gg","alpha-gateway.celeste.gg","cdn.cel
 with p.open("wb") as f: plistlib.dump(plist, f)
 PY
 
+for EXT in "$APP_DIR/PlugIns"/*.appex; do
+    [ -d "$EXT" ] || continue
+    python3 - "$EXT/Info.plist" <<'PY'
+import plistlib, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+with p.open("rb") as f: plist = plistlib.load(f)
+bid = plist.get("CFBundleIdentifier", "")
+prefix = "com.hammerandchisel.discord."
+if bid.startswith(prefix):
+    plist["CFBundleIdentifier"] = "gg.celeste.app." + bid[len(prefix):]
+    with p.open("wb") as f: plistlib.dump(plist, f)
+PY
+    rm -rf "$EXT/_CodeSignature" "$EXT/embedded.mobileprovision"
+    EXT_BIN="$EXT/$(basename "$EXT" .appex)"
+    [ -f "$EXT_BIN" ] && ldid -S "$EXT_BIN"
+done
+
 rm -f "$IPA_OUT"
 ( cd "$EXTRACTED" && zip -qr "$IPA_OUT" Payload )
 
