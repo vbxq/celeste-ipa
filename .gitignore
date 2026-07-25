@@ -13,6 +13,5 @@ tools/*
 !tools/chrome-macos.sh
 .idea/
 *.log
-*.md
 temporary/**
 
