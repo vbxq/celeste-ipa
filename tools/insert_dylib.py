@@ -48,14 +48,25 @@ def _patch(data: bytearray, offset: int, dylib: bytes, strip_sig: bool) -> None:
     p = cmds_start
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack_from("<II", data, p)
+        if cmd == LC_LOAD_DYLIB:
+            name_off = struct.unpack_from("<I", data, p + 8)[0]
+            existing = bytes(data[p + name_off : p + cmdsize]).split(b"\x00", 1)[0]
+            if existing == dylib:
+                raise SystemExit(f"[insert_dylib] {dylib.decode()} already loaded")
         if cmd == LC_SEGMENT_64:
-            fileoff = struct.unpack_from("<Q", data, p + 32)[0]
-            if fileoff > 0:
-                first_section_offset = (
-                    fileoff
-                    if first_section_offset is None
-                    else min(first_section_offset, fileoff)
-                )
+            nsects = struct.unpack_from("<I", data, p + 64)[0]
+            for i in range(nsects):
+                s = p + 72 + i * 80
+                size = struct.unpack_from("<Q", data, s + 40)[0]
+                sect_off = struct.unpack_from("<I", data, s + 48)[0]
+                # the free gap ends at the first section with file content, __TEXT starts at offset 0
+                if size and sect_off:
+                    sect_off += offset
+                    first_section_offset = (
+                        sect_off
+                        if first_section_offset is None
+                        else min(first_section_offset, sect_off)
+                    )
         p += cmdsize
 
     if first_section_offset is None:

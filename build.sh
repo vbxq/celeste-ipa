@@ -2,19 +2,23 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-IPA_IN="$ROOT/Discord.ipa"
-IPA_OUT="$ROOT/Celeste.ipa"
-EXTRACTED="$ROOT/discord-extracted"
+IPA_IN="$(realpath -m "${1:-$ROOT/Discord.ipa}")"
+IPA_OUT="$(realpath -m "${2:-$ROOT/Celeste.ipa}")"
+EXTRACTED="${EXTRACTED:-$ROOT/discord-extracted}"
 DYLIB_NAME="CelestePatch.dylib"
 DYLIB_BUILT="$ROOT/CelestePatch/CelestePatch.dylib"
+# Frameworks/ is signed by every sideloader, a loose dylib at the bundle root is not always
+DYLIB_LOAD="@executable_path/Frameworks/$DYLIB_NAME"
+MACHO_CHECK="$ROOT/tools/macho_check.py"
 
-[ -f "$IPA_IN" ] || { echo "missing Discord.ipa"; exit 1; }
+[ -f "$IPA_IN" ] || { echo "missing $IPA_IN"; exit 1; }
 
 export IPHONEOS_SDK="${IPHONEOS_SDK:-$HOME/theos/sdks/iPhoneOS16.5.sdk}"
 [ -d "$IPHONEOS_SDK" ] || { echo "missing SDK, run bootstrap.sh"; exit 1; }
 
 INSERT_DYLIB="$ROOT/tools/insert_dylib.py"
 [ -x "$INSERT_DYLIB" ] || { echo "missing insert_dylib, run bootstrap.sh"; exit 1; }
+[ -f "$MACHO_CHECK" ] || { echo "missing tools/macho_check.py"; exit 1; }
 command -v ldid >/dev/null || { echo "missing ldid, run bootstrap.sh"; exit 1; }
 
 ( cd "$ROOT/CelestePatch" && make clean && IPHONEOS_SDK="$IPHONEOS_SDK" make )
@@ -30,15 +34,28 @@ APP_DIR=$(find "$EXTRACTED/Payload" -maxdepth 1 -type d -name '*.app' | head -1)
 BINARY="$APP_DIR/$(basename "$APP_DIR" .app)"
 [ -f "$BINARY" ] || { echo "no main binary"; exit 1; }
 
-cp "$ROOT/$DYLIB_NAME" "$APP_DIR/$DYLIB_NAME"
-"$INSERT_DYLIB" --strip-codesig --inplace "@executable_path/$DYLIB_NAME" "$BINARY"
+python3 "$MACHO_CHECK" "$APP_DIR"
+
+ENTS="$(mktemp -d)"
+trap 'rm -rf "$ENTS"' EXIT
+# ldid -S without a file drops the entitlements, and sideloaders provision app groups from them
+sign_keep_entitlements() {
+    local bin="$1" ent="$ENTS/$(basename "$1").plist"
+    ldid -e "$bin" > "$ent" 2>/dev/null || : > "$ent"
+    if [ -s "$ent" ]; then ldid -S"$ent" "$bin"; else ldid -S "$bin"; fi
+}
+
+ldid -e "$BINARY" > "$ENTS/main.plist"
+mkdir -p "$APP_DIR/Frameworks"
+cp "$ROOT/$DYLIB_NAME" "$APP_DIR/Frameworks/$DYLIB_NAME"
+"$INSERT_DYLIB" --strip-codesig --inplace "$DYLIB_LOAD" "$BINARY"
 
 rm -rf "$APP_DIR/_CodeSignature" "$APP_DIR/embedded.mobileprovision"
 find "$APP_DIR" -name '.DS_Store' -delete 2>/dev/null || true
-ldid -S "$BINARY"
-ldid -S "$APP_DIR/$DYLIB_NAME"
+if [ -s "$ENTS/main.plist" ]; then ldid -S"$ENTS/main.plist" "$BINARY"; else ldid -S "$BINARY"; fi
+ldid -S "$APP_DIR/Frameworks/$DYLIB_NAME"
 
-python3 - "$APP_DIR/Info.plist" <<'PY' || true
+python3 - "$APP_DIR/Info.plist" <<'PY'
 import plistlib, sys, pathlib
 p = pathlib.Path(sys.argv[1])
 with p.open("rb") as f: plist = plistlib.load(f)
@@ -67,21 +84,24 @@ if bid.startswith(prefix):
 PY
     rm -rf "$EXT/_CodeSignature" "$EXT/embedded.mobileprovision"
     EXT_BIN="$EXT/$(basename "$EXT" .appex)"
-    [ -f "$EXT_BIN" ] && ldid -S "$EXT_BIN"
+    if [ -f "$EXT_BIN" ]; then sign_keep_entitlements "$EXT_BIN"; fi
 done
+
+python3 "$MACHO_CHECK" --require-dylib "$DYLIB_LOAD" "$APP_DIR"
 
 rm -f "$IPA_OUT"
 ( cd "$EXTRACTED" && zip -qr "$IPA_OUT" Payload )
 
 SIZE=$(stat -c '%s' "$IPA_OUT")
 python3 - "$APP_DIR/Info.plist" "$SIZE" <<PY
-import plistlib, json, pathlib, sys
+import plistlib, json, pathlib, sys, datetime
 plist = plistlib.load(open(sys.argv[1],"rb"))
 p = pathlib.Path("$ROOT/source.json")
 d = json.loads(p.read_text())
 v = d["apps"][0]["versions"][0]
 v["size"] = int(sys.argv[2])
 v["version"] = plist.get("CFBundleShortVersionString", v["version"])
+v["date"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 p.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
 PY
 

@@ -11,11 +11,14 @@ You can just download the [latest release](https://github.com/vbxq/celeste-ipa/r
 If you want to build it yourself
 
 ```sh
-./bootstrap.sh   # once: tools + SDK
-./build.sh       # generates Celeste.ipa
+./bootstrap.sh                          # once: tools + SDK
+./build.sh [Discord.ipa] [Celeste.ipa]  # defaults to both at the repo root
 ```
 
-`build.sh` expects `Discord.ipa` at the repo root.
+The input must be a decrypted Discord IPA: every Mach-O needs `cryptid 0`.
+An App Store copy is FairPlay-encrypted and cannot run once re-signed, so
+`build.sh` refuses it. Decrypt Discord from your own device (for example
+`bagbak` or `frida-ios-dump` on a jailbroken iPhone).
 
 ## Distribution
 
