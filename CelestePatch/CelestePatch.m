@@ -12,6 +12,7 @@ typedef struct {
 static const HostRedirect kRedirects[] = {
     { "gateway.discord.gg",     "alpha-gateway.celeste.gg", NO  },
     { "cdn.discordapp.com",     "cdn.celeste.gg",           NO  },
+    { "cdn.discord.com",        "cdn.celeste.gg",           NO  },
     { "media.discordapp.net",   "media.celeste.gg",         NO  },
     { "images.discordapp.net",  "media.celeste.gg",         NO  },
     { "discord.com",            "alpha.celeste.gg",         YES },
@@ -79,9 +80,35 @@ static BOOL CelesteIsHostOnlyCdn(NSString *host, NSString *path) {
     return path.length == 0 || [path isEqualToString:@"/"];
 }
 
+// DCDBundleUpdater fetches https://discord.com/ios/<CFBundleShortVersionString>/manifest.json;
+// celeste answers that path with the web app (303 then html 200), which the updater applies as an empty ota
+static BOOL CelesteIsOtaUpdate(NSURL *url, NSString *host) {
+    if (host) {
+        return [host caseInsensitiveCompare:@"discord.com"] == NSOrderedSame && [url.path hasPrefix:@"/ios/"];
+    }
+    // the updater joins its url with pathWithComponents:, which may collapse https:// into a hostless https:/
+    NSString *scheme = url.scheme;
+    if (!scheme || [scheme caseInsensitiveCompare:@"https"] != NSOrderedSame) return NO;
+    NSString *abs = url.absoluteString;
+    return abs && [abs rangeOfString:@"discord.com/ios/" options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static NSURL *CelesteBlockedOtaURL(void) {
+    static NSURL *blocked;
+    static dispatch_once_t once;
+    // an unsupported scheme makes the task fail at once, the same path the updater takes offline
+    dispatch_once(&once, ^{ blocked = [[NSURL alloc] initWithString:@"celeste-blocked://ota-disabled/manifest.json"]; });
+    return blocked;
+}
+
 static NSURL *CelesteRewriteURL(NSURL *url) {
     if (!url) return url;
     NSString *host = url.host;
+
+    if (CelesteIsOtaUpdate(url, host)) {
+        NSLog(@"[Celeste] blocked ota request %@", url.absoluteString);
+        return CelesteBlockedOtaURL();
+    }
     if (!host) return url;
 
     if (CelesteIsCdnAssetBypass(host, url.path)) return url;
@@ -104,9 +131,11 @@ static NSURL *CelesteRewriteURL(NSURL *url) {
     return rewritten;
 }
 
+static NSURL *CelesteRewriteURLGuarded(NSURL *url);
+
 static NSURLRequest *CelesteRewriteRequest(NSURLRequest *req) {
     if (!req) return req;
-    NSURL *newURL = CelesteRewriteURL(req.URL);
+    NSURL *newURL = CelesteRewriteURLGuarded(req.URL);
     if (newURL == req.URL) return req;
 
     NSMutableURLRequest *m = [req mutableCopy];
@@ -115,13 +144,16 @@ static NSURLRequest *CelesteRewriteRequest(NSURLRequest *req) {
 }
 
 
-static void CelesteSwap(Class cls, SEL orig, SEL swz) {
-    Method a = class_getInstanceMethod(cls, orig);
-    Method b = class_getInstanceMethod(cls, swz);
+static unsigned gCelesteHooked, gCelesteMissed;
+
+static BOOL CelesteSwap(Class cls, SEL orig, SEL swz) {
+    Method a = cls ? class_getInstanceMethod(cls, orig) : NULL;
+    Method b = cls ? class_getInstanceMethod(cls, swz) : NULL;
     if (!a || !b) {
         NSLog(@"[Celeste] swap miss on %s -> %s / %s",
-              class_getName(cls), sel_getName(orig), sel_getName(swz));
-        return;
+              cls ? class_getName(cls) : "(nil)", sel_getName(orig), sel_getName(swz));
+        gCelesteMissed++;
+        return NO;
     }
     if (class_addMethod(cls,
                         orig,
@@ -134,6 +166,33 @@ static void CelesteSwap(Class cls, SEL orig, SEL swz) {
     } else {
         method_exchangeImplementations(a, b);
     }
+    gCelesteHooked++;
+    return YES;
+}
+
+static BOOL CelesteSwapClass(Class cls, SEL orig, SEL swz) {
+    Method a = cls ? class_getClassMethod(cls, orig) : NULL;
+    Method b = cls ? class_getClassMethod(cls, swz) : NULL;
+    if (!a || !b) {
+        NSLog(@"[Celeste] class swap miss on %s -> %s / %s",
+              cls ? class_getName(cls) : "(nil)", sel_getName(orig), sel_getName(swz));
+        gCelesteMissed++;
+        return NO;
+    }
+    method_exchangeImplementations(a, b);
+    gCelesteHooked++;
+    return YES;
+}
+
+// NSURLComponents.URL may build its result through +URLWithString:, which would re-enter the rewrite
+static __thread BOOL tCelesteInRewrite;
+
+static NSURL *CelesteRewriteURLGuarded(NSURL *url) {
+    if (tCelesteInRewrite) return url;
+    tCelesteInRewrite = YES;
+    NSURL *r = CelesteRewriteURL(url);
+    tCelesteInRewrite = NO;
+    return r;
 }
 
 @interface NSURL (Celeste)
@@ -141,12 +200,12 @@ static void CelesteSwap(Class cls, SEL orig, SEL swz) {
 @implementation NSURL (Celeste)
 + (instancetype)celeste_URLWithString:(NSString *)str {
     NSURL *u = [self celeste_URLWithString:str];
-    NSURL *r = CelesteRewriteURL(u);
+    NSURL *r = CelesteRewriteURLGuarded(u);
     return r ?: u;
 }
 + (instancetype)celeste_URLWithString:(NSString *)str relativeToURL:(NSURL *)base {
     NSURL *u = [self celeste_URLWithString:str relativeToURL:base];
-    NSURL *r = CelesteRewriteURL(u);
+    NSURL *r = CelesteRewriteURLGuarded(u);
     return r ?: u;
 }
 @end
@@ -155,13 +214,13 @@ static void CelesteSwap(Class cls, SEL orig, SEL swz) {
 @end
 @implementation NSURLRequest (Celeste)
 - (instancetype)celeste_initWithURL:(NSURL *)url {
-    NSURL *r = CelesteRewriteURL(url);
+    NSURL *r = CelesteRewriteURLGuarded(url);
     return [self celeste_initWithURL:r ?: url];
 }
 - (instancetype)celeste_initWithURL:(NSURL *)url
                         cachePolicy:(NSURLRequestCachePolicy)cp
                     timeoutInterval:(NSTimeInterval)to {
-    NSURL *r = CelesteRewriteURL(url);
+    NSURL *r = CelesteRewriteURLGuarded(url);
     return [self celeste_initWithURL:r ?: url cachePolicy:cp timeoutInterval:to];
 }
 @end
@@ -170,7 +229,7 @@ static void CelesteSwap(Class cls, SEL orig, SEL swz) {
 @end
 @implementation NSMutableURLRequest (Celeste)
 - (void)celeste_setURL:(NSURL *)url {
-    NSURL *r = CelesteRewriteURL(url);
+    NSURL *r = CelesteRewriteURLGuarded(url);
     [self celeste_setURL:r ?: url];
 }
 @end
@@ -180,11 +239,11 @@ static void CelesteSwap(Class cls, SEL orig, SEL swz) {
 @implementation NSURLSession (Celeste)
 
 - (NSURLSessionDataTask *)celeste_dataTaskWithURL:(NSURL *)url {
-    return [self celeste_dataTaskWithURL:CelesteRewriteURL(url) ?: url];
+    return [self celeste_dataTaskWithURL:CelesteRewriteURLGuarded(url) ?: url];
 }
 - (NSURLSessionDataTask *)celeste_dataTaskWithURL:(NSURL *)url
                                 completionHandler:(void(^)(NSData *, NSURLResponse *, NSError *))h {
-    return [self celeste_dataTaskWithURL:CelesteRewriteURL(url) ?: url completionHandler:h];
+    return [self celeste_dataTaskWithURL:CelesteRewriteURLGuarded(url) ?: url completionHandler:h];
 }
 - (NSURLSessionDataTask *)celeste_dataTaskWithRequest:(NSURLRequest *)req {
     return [self celeste_dataTaskWithRequest:CelesteRewriteRequest(req)];
@@ -195,7 +254,7 @@ static void CelesteSwap(Class cls, SEL orig, SEL swz) {
 }
 
 - (NSURLSessionDownloadTask *)celeste_downloadTaskWithURL:(NSURL *)url {
-    return [self celeste_downloadTaskWithURL:CelesteRewriteURL(url) ?: url];
+    return [self celeste_downloadTaskWithURL:CelesteRewriteURLGuarded(url) ?: url];
 }
 - (NSURLSessionDownloadTask *)celeste_downloadTaskWithRequest:(NSURLRequest *)req {
     return [self celeste_downloadTaskWithRequest:CelesteRewriteRequest(req)];
@@ -211,10 +270,10 @@ static void CelesteSwap(Class cls, SEL orig, SEL swz) {
 }
 
 - (id /*NSURLSessionWebSocketTask*/)celeste_webSocketTaskWithURL:(NSURL *)url {
-    return [self celeste_webSocketTaskWithURL:CelesteRewriteURL(url) ?: url];
+    return [self celeste_webSocketTaskWithURL:CelesteRewriteURLGuarded(url) ?: url];
 }
 - (id)celeste_webSocketTaskWithURL:(NSURL *)url protocols:(NSArray<NSString *> *)protos {
-    return [self celeste_webSocketTaskWithURL:CelesteRewriteURL(url) ?: url protocols:protos];
+    return [self celeste_webSocketTaskWithURL:CelesteRewriteURLGuarded(url) ?: url protocols:protos];
 }
 - (id)celeste_webSocketTaskWithRequest:(NSURLRequest *)req {
     return [self celeste_webSocketTaskWithRequest:CelesteRewriteRequest(req)];
@@ -243,26 +302,44 @@ static void CelesteSwap(Class cls, SEL orig, SEL swz) {
 }
 @end
 
+@interface NSFileManager (Celeste)
+@end
+@implementation NSFileManager (Celeste)
+// a sideloaded build never holds group.com.hammerandchisel.discord, so the system returns nil
+- (NSURL *)celeste_containerURLForSecurityApplicationGroupIdentifier:(NSString *)group {
+    NSURL *u = [self celeste_containerURLForSecurityApplicationGroupIdentifier:group];
+    if (u) return u;
+    NSURL *docs = [[self URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask] lastObject];
+    if (!docs) {
+        NSLog(@"[Celeste] app group %@ unavailable and no documents directory", group);
+        return nil;
+    }
+    NSURL *fallback = [docs URLByAppendingPathComponent:@"AppGroup" isDirectory:YES];
+    NSError *err = nil;
+    if (![self createDirectoryAtURL:fallback withIntermediateDirectories:YES attributes:nil error:&err]) {
+        NSLog(@"[Celeste] app group fallback for %@ failed: %@", group, err);
+        return nil;
+    }
+    return fallback;
+}
+@end
+
 __attribute__((constructor))
 static void CelestePatchInit(void) {
     @autoreleasepool {
         NSLog(@"[Celeste] bootstrap");
 
-        Class URL   = [NSURL class];
-        Class Req   = [NSURLRequest class];
-        Class MReq  = [NSMutableURLRequest class];
-        Class Sess  = [NSURLSession class];
+        Class URL   = objc_getClass("NSURL");
+        Class Req   = objc_getClass("NSURLRequest");
+        Class MReq  = objc_getClass("NSMutableURLRequest");
+        Class Sess  = objc_getClass("NSURLSession");
+        Class FM    = objc_getClass("NSFileManager");
 
-        // NSURL class methods
-        Method a, b;
-        a = class_getClassMethod(URL, @selector(URLWithString:));
-        b = class_getClassMethod(URL, @selector(celeste_URLWithString:));
-        if (a && b) method_exchangeImplementations(a, b);
-        a = class_getClassMethod(URL, @selector(URLWithString:relativeToURL:));
-        b = class_getClassMethod(URL, @selector(celeste_URLWithString:relativeToURL:));
-        if (a && b) method_exchangeImplementations(a, b);
+        CelesteSwapClass(URL, @selector(URLWithString:),
+                              @selector(celeste_URLWithString:));
+        CelesteSwapClass(URL, @selector(URLWithString:relativeToURL:),
+                              @selector(celeste_URLWithString:relativeToURL:));
 
-        // NSURLRequest
         CelesteSwap(Req,  @selector(initWithURL:),
                           @selector(celeste_initWithURL:));
         CelesteSwap(Req,  @selector(initWithURL:cachePolicy:timeoutInterval:),
@@ -270,7 +347,6 @@ static void CelestePatchInit(void) {
         CelesteSwap(MReq, @selector(setURL:),
                           @selector(celeste_setURL:));
 
-        // NSURLSession data/download/upload/websocket
         CelesteSwap(Sess, @selector(dataTaskWithURL:),
                           @selector(celeste_dataTaskWithURL:));
         CelesteSwap(Sess, @selector(dataTaskWithURL:completionHandler:),
@@ -294,6 +370,10 @@ static void CelestePatchInit(void) {
         CelesteSwap(Sess, @selector(webSocketTaskWithRequest:),
                           @selector(celeste_webSocketTaskWithRequest:));
 
-        NSLog(@"[Celeste] bootstrap done, %zu redirects active", kRedirectsCount);
+        CelesteSwap(FM,   @selector(containerURLForSecurityApplicationGroupIdentifier:),
+                          @selector(celeste_containerURLForSecurityApplicationGroupIdentifier:));
+
+        NSLog(@"[Celeste] bootstrap done, %zu redirects, %u hooks installed, %u missed",
+              kRedirectsCount, gCelesteHooked, gCelesteMissed);
     }
 }
